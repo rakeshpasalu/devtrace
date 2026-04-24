@@ -1,0 +1,46 @@
+version: "3.9"
+
+services:
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: devtrace-collector
+    ports:
+      - "${DEVTRACE_PORT:-9000}:9000"
+    environment:
+      NODE_ENV: production
+      PORT: 9000
+      DEVTRACE_API_KEY: "${DEVTRACE_API_KEY:-}"
+      DEVTRACE_CORS_ORIGINS: "${DEVTRACE_CORS_ORIGINS:-*}"
+      DEVTRACE_MAX_EVENTS: "${DEVTRACE_MAX_EVENTS:-50000}"
+      DEVTRACE_RATE_LIMIT_MAX: "${DEVTRACE_RATE_LIMIT_MAX:-300}"
+      DEVTRACE_INGEST_RATE_MAX: "${DEVTRACE_INGEST_RATE_MAX:-600}"
+      DEVTRACE_LOG_LEVEL: "${DEVTRACE_LOG_LEVEL:-info}"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/api/v1/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
+  # Optional: run frontend separately in dev mode
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev"
+    environment:
+      VITE_DEVTRACE_API_URL: "http://localhost:${DEVTRACE_PORT:-9000}"
+    profiles:
+      - dev
+
