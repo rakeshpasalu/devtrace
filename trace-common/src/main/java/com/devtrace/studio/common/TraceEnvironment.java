@@ -64,10 +64,19 @@ public final class TraceEnvironment {
             tracerProviderBuilder.addSpanProcessor(BatchSpanProcessor.builder(exporter).build());
         }
 
-        OpenTelemetrySdk sdk = OpenTelemetrySdk.builder()
-                .setTracerProvider(tracerProviderBuilder.build())
-                .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
-                .buildAndRegisterGlobal();
+        OpenTelemetrySdk sdk;
+        try {
+            sdk = OpenTelemetrySdk.builder()
+                    .setTracerProvider(tracerProviderBuilder.build())
+                    .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
+                    .buildAndRegisterGlobal();
+        } catch (Exception ignored) {
+            // Another OTel SDK is already registered globally – build without registering
+            sdk = OpenTelemetrySdk.builder()
+                    .setTracerProvider(tracerProviderBuilder.build())
+                    .setPropagators(ContextPropagators.create(W3CTraceContextPropagator.getInstance()))
+                    .build();
+        }
 
         openTelemetry = sdk;
         tracer = sdk.getTracer("com.devtrace.studio");

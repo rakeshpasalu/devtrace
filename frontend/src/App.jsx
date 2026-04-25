@@ -1,11 +1,12 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
-  Activity, BarChart3, Bell, Bookmark, Box, Brain, Clock, Crosshair, Flame, GitBranch, GitCompare, HelpCircle, LayoutDashboard,
+  Activity, BarChart3, Bell, Bookmark, Box, Brain, Clock, Crosshair, FileText, Flame, GitBranch, GitCompare, HelpCircle, LayoutDashboard,
   List, Network, Play, Pause, Radio, Search, Server, Settings, Stethoscope, Target, Terminal, TrendingUp, Zap, Rocket,
   Skull, Award
 } from "lucide-react";
 import AICopilotPage from "./components/AICopilotPage.jsx";
 import LiveTailPage from "./components/LiveTailPage.jsx";
+import LogExplorerPage from "./components/LogExplorerPage.jsx";
 import EndpointAnalyticsPage from "./components/EndpointAnalyticsPage.jsx";
 import FaqPage from "./components/FaqPage.jsx";
 import NerdConsole from "./components/NerdConsole.jsx";
@@ -44,6 +45,7 @@ const PAGES = [
   { id: "ais",         label: "Architecture Score",  icon: Award,           group: "observe" },
   { id: "topology",    label: "Service Topology",   icon: Network,         group: "observe" },
   { id: "livetail",    label: "Live Tail",          icon: Radio,           group: "observe" },
+  { id: "logs",        label: "Log Explorer",       icon: FileText,        group: "observe" },
   { id: "beans",       label: "Bean Graph",         icon: GitBranch,       group: "inspect" },
   { id: "impact",      label: "Blast Radius",       icon: Crosshair,       group: "inspect" },
   { id: "diff",        label: "Trace Diff",         icon: GitCompare,      group: "inspect" },
@@ -65,7 +67,8 @@ const EMPTY_SNAPSHOT = {
   beanGraph: { nodes: [], links: [] },
   startup: { lifecycle: [], recentEvents: [], autoConfiguration: {} },
   diagnostics: { errors: [], slowSpans: [], hottestComponents: [], services: [] },
-  endpointAnalytics: []
+  endpointAnalytics: [],
+  logs: [],
 };
 
 /* Time range options */
@@ -162,7 +165,28 @@ function AppShell() {
       const d = JSON.parse(m.data);
       if (d.type === "snapshot") startTransition(() => { setSnapshot(d.payload); setLastUpdated(Date.now()); });
       if (d.type === "events") startTransition(() => {
-        setSnapshot(c => ({ ...c, recentEvents: [...(c.recentEvents ?? []), ...d.payload].slice(-1000) }));
+        setSnapshot(c => {
+          const updated = { ...c, recentEvents: [...(c.recentEvents ?? []), ...d.payload].slice(-1000) };
+          // Extract LOG events and append to logs array in real-time
+          const newLogs = d.payload
+            .filter(e => e.type === "LOG")
+            .map((e, i) => ({
+              id: e.eventId ?? `log-ws-${Date.now()}-${i}`,
+              timestamp: e.timestamp,
+              level: (e.attributes?.level ?? e.status ?? "INFO").toUpperCase(),
+              logger: e.attributes?.logger ?? e.component ?? e.name ?? "unknown",
+              message: e.attributes?.message ?? e.name ?? "",
+              thread: e.attributes?.thread ?? null,
+              traceId: e.traceId ?? null,
+              spanId: e.spanId ?? null,
+              service: e.service ?? null,
+              exception: e.attributes?.exception ?? e.attributes?.stackTrace ?? null,
+            }));
+          if (newLogs.length > 0) {
+            updated.logs = [...(c.logs ?? []), ...newLogs].slice(-5000);
+          }
+          return updated;
+        });
       });
     });
     return () => { cancelled = true; clearInterval(iv); ws.close(); };
@@ -413,6 +437,10 @@ function AppShell() {
         {activePage === "livetail" && (
           <LiveTailPage recentEvents={filteredEvents} snapshot={filteredSnapshot} />
         )}
+        {activePage === "logs" && (
+          <LogExplorerPage logs={snapshot.logs ?? []}
+            onNavigateToTrace={(id) => { setSelectedTraceId(id); setActivePage("traces"); }} />
+        )}
         {activePage === "aicopilot" && (
           <AICopilotPage requests={filteredRequests} snapshot={filteredSnapshot}
             selectedTraceId={selectedTraceId}
@@ -597,6 +625,7 @@ function DashboardPage({ snapshot }) {
         <MetricCard icon={<List size={16}/>} label="Events Retained" value={stats.retainedEvents ?? 0} />
         <MetricCard icon={<Box size={16}/>} label="Beans Mapped" value={stats.beanNodes ?? 0} />
         <MetricCard icon={<Server size={16}/>} label="Services" value={stats.services ?? 0} />
+        <MetricCard icon={<FileText size={16}/>} label="Logs" value={stats.logCount ?? 0} />
       </div>
 
       <div className="dashboard-grid">
@@ -649,25 +678,32 @@ function DashboardPage({ snapshot }) {
         {/* Live Activity Feed */}
         <div className="card">
           <div className="card-header">
-            <span className="card-title">Live Activity</span>
+            <span className="card-title" style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: "var(--green)", animation: "pulse 1.5s infinite" }} />
+              Live Activity
+            </span>
             <span className="card-badge">{latestRequests.length} recent</span>
           </div>
           <div className="dash-activity-list">
             {latestRequests.length === 0 ? (
-              <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Waiting for requests…</p>
-            ) : latestRequests.map(r => (
-              <div key={r.traceId} className="dash-activity-row">
-                <span className="dash-activity-method" style={{
-                  color: r.method === "GET" ? "var(--green)" : r.method === "POST" ? "var(--accent)" :
-                    r.method === "DELETE" ? "var(--red)" : "var(--amber)"
-                }}>{r.method}</span>
-                <span className="dash-activity-path" title={r.path}>{r.path}</span>
-                <span className={`dash-activity-status ${r.status === "ERROR" || String(r.status).startsWith("5") ? "is-err" : ""}`}>
-                  {r.status === "IN_PROGRESS" ? "…" : r.status}
-                </span>
-                <span className="dash-activity-dur">{formatDuration(r.durationMs)}</span>
-              </div>
-            ))}
+              <p style={{ color: "var(--text-muted)", fontSize: 13, padding: "20px 0", textAlign: "center" }}>Waiting for requests…</p>
+            ) : latestRequests.map(r => {
+              const ago = Math.max(0, Math.round((Date.now() - (r.lastSeen > 0 && r.lastSeen < 1e12 ? r.lastSeen * 1000 : r.lastSeen)) / 1000));
+              const agoLabel = ago < 60 ? `${ago}s ago` : `${Math.floor(ago / 60)}m ago`;
+              return (
+                <div key={r.traceId} className="dash-activity-row">
+                  <span className="dash-activity-method" style={{
+                    color: r.method === "GET" ? "var(--green)" : r.method === "POST" ? "var(--accent)" :
+                      r.method === "DELETE" ? "var(--red)" : "var(--amber)"
+                  }}>{r.method}</span>
+                  <span className="dash-activity-path" title={r.path}>{r.path}</span>
+                  <span className={`dash-activity-status ${r.status === "ERROR" || String(r.status).startsWith("5") ? "is-err" : ""}`}>
+                    {r.status === "IN_PROGRESS" ? "⏳" : r.status}
+                  </span>
+                  <span className="dash-activity-dur" title={agoLabel}>{r.status === "IN_PROGRESS" ? agoLabel : formatDuration(r.durationMs)}</span>
+                </div>
+              );
+            })}
           </div>
         </div>
 

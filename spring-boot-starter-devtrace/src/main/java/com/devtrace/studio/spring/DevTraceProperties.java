@@ -21,6 +21,8 @@ public class DevTraceProperties {
     private boolean hibernateTracingEnabled = true;
     private boolean restTemplateTracingEnabled = true;
     private boolean webClientTracingEnabled = true;
+    private boolean logTracingEnabled = true;
+    private String logThreshold = "DEBUG";
     private final List<String> excludedPathPrefixes = new ArrayList<>(List.of("/favicon.ico"));
 
     public boolean isEnabled() {
@@ -133,6 +135,22 @@ public class DevTraceProperties {
 
     public void setWebClientTracingEnabled(boolean webClientTracingEnabled) {
         this.webClientTracingEnabled = webClientTracingEnabled;
+    }
+
+    public boolean isLogTracingEnabled() {
+        return logTracingEnabled;
+    }
+
+    public void setLogTracingEnabled(boolean logTracingEnabled) {
+        this.logTracingEnabled = logTracingEnabled;
+    }
+
+    public String getLogThreshold() {
+        return logThreshold;
+    }
+
+    public void setLogThreshold(String logThreshold) {
+        this.logThreshold = logThreshold;
     }
 
     public List<String> getExcludedPathPrefixes() {

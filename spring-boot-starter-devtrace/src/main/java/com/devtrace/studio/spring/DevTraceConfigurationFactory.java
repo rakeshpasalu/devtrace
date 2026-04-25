@@ -14,10 +14,13 @@ public final class DevTraceConfigurationFactory {
                 deriveDefaultServiceName()
         );
 
+        String rawBackendUrl = firstNonBlank(environment.getProperty("devtrace.backend-url"), System.getenv("DEVTRACE_BACKEND_URL"), "http://127.0.0.1:9000");
+        String backendUrl = normalizeIngestUrl(rawBackendUrl);
+
         return new TraceConfiguration(
                 serviceName,
                 firstNonBlank(environment.getProperty("devtrace.instance-id"), System.getenv("DEVTRACE_INSTANCE_ID")),
-                firstNonBlank(environment.getProperty("devtrace.backend-url"), System.getenv("DEVTRACE_BACKEND_URL"), "http://127.0.0.1:9000"),
+                backendUrl,
                 firstNonBlank(environment.getProperty("devtrace.otlp-endpoint"), System.getenv("DEVTRACE_OTLP_ENDPOINT")),
                 firstNonBlank(environment.getProperty("devtrace.api-key"), System.getenv("DEVTRACE_API_KEY"))
         );
@@ -27,7 +30,7 @@ public final class DevTraceConfigurationFactory {
         return new TraceConfiguration(
                 firstNonBlank(System.getProperty("devtrace.service-name"), System.getProperty("spring.application.name"), deriveDefaultServiceName()),
                 firstNonBlank(System.getProperty("devtrace.instance-id"), System.getenv("DEVTRACE_INSTANCE_ID")),
-                firstNonBlank(System.getProperty("devtrace.backend-url"), System.getenv("DEVTRACE_BACKEND_URL"), "http://127.0.0.1:9000"),
+                normalizeIngestUrl(firstNonBlank(System.getProperty("devtrace.backend-url"), System.getenv("DEVTRACE_BACKEND_URL"), "http://127.0.0.1:9000")),
                 firstNonBlank(System.getProperty("devtrace.otlp-endpoint"), System.getenv("DEVTRACE_OTLP_ENDPOINT")),
                 firstNonBlank(System.getProperty("devtrace.api-key"), System.getenv("DEVTRACE_API_KEY"))
         );
@@ -62,6 +65,22 @@ public final class DevTraceConfigurationFactory {
 
     private static boolean hasText(String value) {
         return value != null && !value.isBlank();
+    }
+
+    /**
+     * Ensures the backend URL ends with /ingest so the publisher POSTs to the correct endpoint.
+     */
+    private static String normalizeIngestUrl(String url) {
+        if (url == null) return null;
+        url = url.strip();
+        // Strip trailing slash
+        while (url.endsWith("/")) {
+            url = url.substring(0, url.length() - 1);
+        }
+        if (!url.endsWith("/ingest")) {
+            url = url + "/ingest";
+        }
+        return url;
     }
 }
 

@@ -45,34 +45,34 @@ DevTrace Studio is a developer-focused observability platform that provides deep
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        Spring Boot Application                       │
+│                        Spring Boot Application                      │
 │  ┌──────────────────┐  ┌──────────────────────────────────────────┐ │
-│  │  DevTrace Agent   │  │  spring-boot-starter-devtrace            │ │
-│  │  (ByteBuddy)      │  │  (AOP interceptors + filters)           │ │
+│  │  DevTrace Agent  │  │  spring-boot-starter-devtrace            │ │
+│  │  (ByteBuddy)     │  │  (AOP interceptors + filters)            │ │
 │  └────────┬─────────┘  └──────────────┬───────────────────────────┘ │
 └───────────┼────────────────────────────┼────────────────────────────┘
             │                            │
             ▼                            ▼
      ┌──────────────────────────────────────┐
-     │          trace-common                 │
-     │   (event model + W3C propagation)     │
+     │          trace-common                │
+     │   (event model + W3C propagation)    │
      └──────────────┬───────────────────────┘
                     │  HTTP POST /ingest
                     ▼
      ┌──────────────────────────────────────┐
-     │       Node.js Collector (Express 5)   │
+     │       Node.js Collector (Express 5)  │
      │  ┌────────────┐ ┌─────────────────┐  │
-     │  │ In-Memory   │ │ WebSocket       │  │
-     │  │ Event Store  │ │ Broadcast       │  │
+     │  │ In-Memory  │ │ WebSocket       │  │
+     │  │ Event Store│ │ Broadcast       │  │
      │  └────────────┘ └────────┬────────┘  │
      └──────────────────────────┼───────────┘
                                 │  ws://
                                 ▼
      ┌──────────────────────────────────────┐
-     │     React 19 Control Center           │
-     │  26 specialized views                 │
-     │  Real-time WebSocket updates          │
-     │  URL deep linking                     │
+     │     React 19 Control Center          │
+     │  26 specialized views                │
+     │  Real-time WebSocket updates         │
+     │  URL deep linking                    │
      └──────────────────────────────────────┘
 ```
 
@@ -224,6 +224,8 @@ devtrace:
   backend-url: http://127.0.0.1:9000
   service-name: my-service
   api-key: ""  # set if collector requires authentication
+  log-tracing-enabled: true   # forward application logs to DevTrace (default: true)
+  log-threshold: DEBUG         # minimum log level to capture: TRACE, DEBUG, INFO, WARN, ERROR
 ```
 
 **Additional capabilities:** WebClient tracing, async executor propagation, Hibernate SQL, bean dependency graph, auto-configuration reports.
@@ -259,6 +261,7 @@ java -cp java-agent/target/java-agent-1.0.0-SNAPSHOT.jar \
 | Hibernate SQL visibility | — | ✅ | ✅ |
 | Bean dependency graph | — | ✅ | ✅ |
 | Auto-config report | — | ✅ | ✅ |
+| Log forwarding (Logback) | — | ✅ | ✅ |
 
 ---
 

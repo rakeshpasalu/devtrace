@@ -36,6 +36,8 @@ export class EventStore {
     this.lastClassLoadingSnapshot = null;
     this.endpointStats = new Map();   // key = "METHOD /path" → { durations[], errors, total, ... }
     this.bookmarks = new Map();       // traceId → bookmark object (server-synced saved views)
+    this.logs = [];                   // ring buffer for LOG events
+    this.maxLogs = 5_000;
   }
 
   ingest(input) {
@@ -68,14 +70,16 @@ export class EventStore {
         completedRequests: requests.filter((request) => request.status !== "IN_PROGRESS").length,
         beanNodes: this.beanNodes.size,
         beanEdges: this.beanEdges.size,
-        services: diagnostics.services.length
+        services: diagnostics.services.length,
+        logCount: this.logs.length,
       },
       recentEvents: this.events.slice(-750),
       requests,
       beanGraph: this.beanGraph(),
       startup: this.startupSummary(),
       diagnostics,
-      endpointAnalytics: this.analytics()
+      endpointAnalytics: this.analytics(),
+      logs: this.logs.slice(-200),
     };
   }
 
@@ -144,6 +148,28 @@ export class EventStore {
       return [];
     }
     return this.queryRequests({ requestId, limit: 100 });
+  }
+
+  queryLogs(filters = {}) {
+    const { level, q, traceId, limit: rawLimit } = filters;
+    const limit = Math.max(1, Number(rawLimit ?? 500));
+    let result = [...this.logs];
+    if (level && level !== "ALL") {
+      const levels = level.split(",").map(l => l.trim().toUpperCase());
+      result = result.filter(l => levels.includes(l.level));
+    }
+    if (traceId) {
+      result = result.filter(l => l.traceId === traceId);
+    }
+    if (q) {
+      const lq = q.toLowerCase();
+      result = result.filter(l =>
+        (l.message ?? "").toLowerCase().includes(lq) ||
+        (l.logger ?? "").toLowerCase().includes(lq) ||
+        (l.exception ?? "").toLowerCase().includes(lq)
+      );
+    }
+    return result.slice(-limit);
   }
 
   beanGraph() {
@@ -256,6 +282,22 @@ export class EventStore {
     if (event.type === "SPAN_FINISHED" && Number(event.durationMs) >= SLOW_METHOD_THRESHOLD_MS) {
       this.slowSpans.push(event);
       this.trim(this.slowSpans, 800);
+    }
+
+    if (event.type === "LOG") {
+      this.logs.push({
+        id: event.eventId ?? `log-${this.eventCount}`,
+        timestamp: event.timestamp,
+        level: (event.attributes?.level ?? event.status ?? "INFO").toUpperCase(),
+        logger: event.attributes?.logger ?? event.component ?? event.name ?? "unknown",
+        message: event.attributes?.message ?? event.name ?? "",
+        thread: event.attributes?.thread ?? null,
+        traceId: event.traceId ?? null,
+        spanId: event.spanId ?? null,
+        service: event.service ?? null,
+        exception: event.attributes?.exception ?? event.attributes?.stackTrace ?? null,
+      });
+      this.trim(this.logs, this.maxLogs);
     }
   }
 

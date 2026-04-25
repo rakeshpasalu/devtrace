@@ -117,4 +117,15 @@ public class DevTraceAutoConfiguration {
                     properties.put("hibernate.session_factory.statement_inspector", inspector));
         }
     }
+
+    @org.springframework.context.annotation.Configuration(proxyBeanMethods = false)
+    @ConditionalOnClass(name = "ch.qos.logback.classic.LoggerContext")
+    @ConditionalOnProperty(prefix = "devtrace", name = "log-tracing-enabled", matchIfMissing = true)
+    static class LogTracingConfiguration {
+        @Bean
+        @ConditionalOnMissingBean
+        DevTraceLogAppenderInstaller devTraceLogAppenderInstaller(DevTraceProperties properties) {
+            return new DevTraceLogAppenderInstaller(properties);
+        }
+    }
 }

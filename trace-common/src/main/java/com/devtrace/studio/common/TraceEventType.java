@@ -20,6 +20,7 @@ public enum TraceEventType {
     ASYNC_EXECUTION,
     DATABASE_QUERY,
     EXTERNAL_CALL,
-    ERROR
+    ERROR,
+    LOG
 }
 

@@ -109,6 +109,15 @@ v1.get("/requests/:traceId/replay", (req, res) => {
 
 v1.get("/analytics", (_req, res) => res.json(store.analytics()));
 
+v1.get("/logs", (req, res) => {
+  res.json(store.queryLogs({
+    level: req.query.level,
+    q: req.query.q,
+    traceId: req.query.traceId,
+    limit: req.query.limit,
+  }));
+});
+
 v1.get("/report", (_req, res) => res.json(store.report()));
 v1.get("/architecture-score", (_req, res) => res.json(store.architectureScore()));
 

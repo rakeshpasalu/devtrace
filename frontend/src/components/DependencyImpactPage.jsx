@@ -46,15 +46,28 @@ function computeBlastRadius(beanGraph, selectedNode) {
 /* ─── Main Component ─── */
 export default function DependencyImpactPage({ snapshot }) {
   const beanGraph = snapshot?.beanGraph ?? { nodes: [], links: [] };
-  const nodes = beanGraph.nodes ?? [];
-  const links = beanGraph.links ?? [];
+  const rawNodes = beanGraph.nodes ?? [];
+  const rawLinks = beanGraph.links ?? [];
   const [selected, setSelected] = useState(null);
   const [search, setSearch] = useState("");
   const [activeTab, setActiveTab] = useState("graph"); // graph | affected | deps
   const svgContainerRef = useRef(null);
   const svgRef = useRef(null);
 
-  const blast = useMemo(() => computeBlastRadius(beanGraph, selected), [beanGraph, selected]);
+  // ── Stable fingerprints so memos/effects only recompute when data actually changes ──
+  const nodeFingerprint = useMemo(() => rawNodes.map(n => n.id).sort().join("|"), [rawNodes]);
+  const linkFingerprint = useMemo(() => rawLinks.map(l => `${l.source}->${l.target}`).sort().join("|"), [rawLinks]);
+
+  // Stable node/link arrays that only change when structure changes
+  const nodes = useMemo(() => rawNodes, [nodeFingerprint]);
+  const links = useMemo(() => rawLinks, [linkFingerprint]);
+
+  const blast = useMemo(() => computeBlastRadius({ nodes, links }, selected), [nodeFingerprint, linkFingerprint, selected]);
+
+  // Stable key for the blast result (so D3 effect doesn't re-trigger on identical data)
+  const blastKey = useMemo(() => {
+    return `${selected}::${blast.affected.map(a => `${a.id}@${a.depth}`).join(",")}::${blast.directDependencies.join(",")}`;
+  }, [blast, selected]);
 
   const filteredNodes = useMemo(() => {
     if (!search) return nodes;
@@ -97,143 +110,363 @@ export default function DependencyImpactPage({ snapshot }) {
     .filter(n => n.affectedCount > 0 || n.directDeps > 0)
     .sort((a, b) => b.affectedCount - a.affectedCount)
     .slice(0, 20);
-  }, [nodes, links]);
+  }, [nodeFingerprint, linkFingerprint]);
 
-  const affectedSet = useMemo(() => new Set(blast.affected.map(a => a.id)), [blast]);
+  const affectedSet = useMemo(() => new Set(blast.affected.map(a => a.id)), [blastKey]);
 
   // Severity label
   const severity = blast.affected.length > 10 ? "CRITICAL" : blast.affected.length > 5 ? "HIGH" : blast.affected.length > 2 ? "MEDIUM" : blast.affected.length > 0 ? "LOW" : null;
   const severityColor = severity === "CRITICAL" ? "var(--red)" : severity === "HIGH" ? "var(--amber)" : severity === "MEDIUM" ? "#facc15" : "var(--green)";
 
-  // D3 Blast radius visualization
+  // How many depth levels to show in graph
+  const [maxVisibleDepth, setMaxVisibleDepth] = useState(3);
+
+  // Reset visible depth when selecting a different node
+  useEffect(() => { setMaxVisibleDepth(3); }, [selected]);
+
+  // D3 Blast radius visualization — scalable radial layout
   useEffect(() => {
-    const svg = d3.select(svgRef.current);
+    const svgEl = svgRef.current;
+    if (!svgEl) return;
+    const svg = d3.select(svgEl);
     svg.selectAll("*").remove();
     if (!selected || nodes.length === 0 || activeTab !== "graph") return;
 
     const container = svgContainerRef.current;
     if (!container) return;
     const width = container.clientWidth || 700;
-    const height = Math.max(400, Math.min(600, container.clientHeight || 500));
+    const height = Math.max(450, Math.min(650, container.clientHeight || 550));
+    const cx = width / 2;
+    const cy = height / 2;
 
     svg.attr("viewBox", `0 0 ${width} ${height}`);
 
-    // Only show relevant nodes
-    const relevantIds = new Set([selected, ...blast.affected.map(a => a.id)]);
-    for (const l of links) {
-      if (l.source === selected) relevantIds.add(l.target);
+    // ── Build pruned node set (cap per ring, collapse deep levels) ──
+    const MAX_PER_RING = 14;
+    const depthGroups = new Map();
+    for (const a of blast.affected) {
+      if (!depthGroups.has(a.depth)) depthGroups.set(a.depth, []);
+      depthGroups.get(a.depth).push(a);
     }
 
-    const visNodes = nodes.filter(n => relevantIds.has(n.id)).map(n => ({
-      ...n,
-      isSelected: n.id === selected,
-      isAffected: affectedSet.has(n.id),
-      isDep: !affectedSet.has(n.id) && n.id !== selected,
-      affectedDepth: blast.affected.find(a => a.id === n.id)?.depth ?? 0,
-    }));
-    const visLinks = links.filter(l => relevantIds.has(l.source) && relevantIds.has(l.target)).map(l => ({ ...l }));
+    const visNodes = [];
+    const summaryNodes = [];
+    const visibleIds = new Set([selected]);
 
-    if (visNodes.length === 0) return;
-
-    // Defs: arrow markers + glow filter
-    const defs = svg.append("defs");
-    defs.append("marker")
-      .attr("id", "blast-arrow-red").attr("viewBox", "0 -5 10 10")
-      .attr("refX", 22).attr("refY", 0).attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
-      .append("path").attr("d", "M0,-4L8,0L0,4").attr("fill", "rgba(248,113,113,0.6)");
-    defs.append("marker")
-      .attr("id", "blast-arrow-dim").attr("viewBox", "0 -5 10 10")
-      .attr("refX", 22).attr("refY", 0).attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
-      .append("path").attr("d", "M0,-4L8,0L0,4").attr("fill", "rgba(148,163,184,0.2)");
-
-    // Glow filter
-    const filter = defs.append("filter").attr("id", "glow");
-    filter.append("feGaussianBlur").attr("stdDeviation", "3").attr("result", "coloredBlur");
-    const merge = filter.append("feMerge");
-    merge.append("feMergeNode").attr("in", "coloredBlur");
-    merge.append("feMergeNode").attr("in", "SourceGraphic");
-
-    // Links
-    const link = svg.append("g").selectAll("line").data(visLinks).join("line")
-      .attr("stroke", d => {
-        const isImpact = affectedSet.has(d.source) || d.target === selected || d.source === selected;
-        return isImpact ? "rgba(248,113,113,0.35)" : "rgba(148,163,184,0.08)";
-      })
-      .attr("stroke-width", d => (affectedSet.has(d.source) || d.target === selected || d.source === selected) ? 1.5 : 0.5)
-      .attr("marker-end", d => (affectedSet.has(d.source) || d.target === selected || d.source === selected) ? "url(#blast-arrow-red)" : "url(#blast-arrow-dim)");
-
-    // Node groups
-    const nodeGroup = svg.append("g").selectAll("g").data(visNodes).join("g")
-      .attr("cursor", "pointer")
-      .call(d3.drag()
-        .on("start", (ev, d) => { if (!ev.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-        .on("drag", (ev, d) => { d.fx = ev.x; d.fy = ev.y; })
-        .on("end", (ev, d) => { if (!ev.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
-      )
-      .on("click", (ev, d) => setSelected(d.id));
-
-    // Pulse ring for selected
-    nodeGroup.filter(d => d.isSelected).append("circle")
-      .attr("r", 28).attr("fill", "none").attr("stroke", "#f87171").attr("stroke-width", 1.5)
-      .attr("stroke-dasharray", "4 3").attr("opacity", 0.5);
-
-    // Node circles
-    nodeGroup.append("circle")
-      .attr("r", d => d.isSelected ? 18 : d.isAffected ? 12 : 9)
-      .attr("fill", d =>
-        d.isSelected ? "rgba(248,113,113,0.2)" :
-        d.isAffected ? `rgba(251,191,36,${Math.max(0.06, 0.2 - d.affectedDepth * 0.03)})` :
-        "rgba(96,165,250,0.08)"
-      )
-      .attr("stroke", d =>
-        d.isSelected ? "#f87171" :
-        d.isAffected ? `rgba(251,191,36,${Math.max(0.3, 0.8 - d.affectedDepth * 0.1)})` :
-        "rgba(148,163,184,0.2)"
-      )
-      .attr("stroke-width", d => d.isSelected ? 2.5 : 1.5)
-      .attr("filter", d => d.isSelected ? "url(#glow)" : null);
-
-    // Center icon
-    nodeGroup.filter(d => d.isSelected).append("text")
-      .text("⊗").attr("text-anchor", "middle").attr("dy", 5).attr("font-size", 14).attr("fill", "#f87171");
-
-    nodeGroup.filter(d => d.isAffected && !d.isSelected).append("circle")
-      .attr("r", 3).attr("fill", d => d.affectedDepth === 1 ? "#f87171" : "#fbbf24");
-
-    // Labels
-    nodeGroup.append("text")
-      .text(d => {
-        const name = d.id;
-        return name.length > 22 ? name.slice(0, 20) + "…" : name;
-      })
-      .attr("text-anchor", "middle")
-      .attr("dy", d => d.isSelected ? 32 : d.isAffected ? 22 : 18)
-      .attr("font-size", d => d.isSelected ? 11 : 9)
-      .attr("font-weight", d => d.isSelected ? 700 : 500)
-      .attr("fill", d => d.isSelected ? "#f87171" : d.isAffected ? "#fbbf24" : "rgba(148,163,184,0.6)")
-      .attr("font-family", "var(--font-mono)");
-
-    const sim = d3.forceSimulation(visNodes)
-      .force("link", d3.forceLink(visLinks).id(d => d.id).distance(90).strength(0.5))
-      .force("charge", d3.forceManyBody().strength(-250))
-      .force("center", d3.forceCenter(width / 2, height / 2))
-      .force("collide", d3.forceCollide(35))
-      .force("x", d3.forceX(width / 2).strength(0.05))
-      .force("y", d3.forceY(height / 2).strength(0.05));
-
-    sim.on("tick", () => {
-      // Clamp positions
-      visNodes.forEach(d => {
-        d.x = Math.max(30, Math.min(width - 30, d.x));
-        d.y = Math.max(30, Math.min(height - 30, d.y));
-      });
-      link.attr("x1", d => d.source.x).attr("y1", d => d.source.y)
-        .attr("x2", d => d.target.x).attr("y2", d => d.target.y);
-      nodeGroup.attr("transform", d => `translate(${d.x},${d.y})`);
+    // Selected node at center
+    visNodes.push({
+      id: selected, isSelected: true, isAffected: false,
+      isSummary: false, isDep: false, affectedDepth: 0,
     });
 
-    return () => sim.stop();
-  }, [selected, nodes.length, links.length, blast, activeTab]);
+    // Affected — pruned per ring, limited by maxVisibleDepth
+    const sortedDepths = [...depthGroups.keys()].sort((a, b) => a - b);
+    for (const depth of sortedDepths) {
+      if (depth > maxVisibleDepth) {
+        const totalRemaining = sortedDepths
+          .filter(d => d > maxVisibleDepth)
+          .reduce((sum, d) => sum + depthGroups.get(d).length, 0);
+        if (totalRemaining > 0) {
+          summaryNodes.push({
+            id: "__summary_deep__", isSummary: true, isSelected: false,
+            isAffected: false, isDep: false, affectedDepth: maxVisibleDepth + 1,
+            label: `+${totalRemaining} more`,
+            sublabel: `depth ${maxVisibleDepth + 1}–${sortedDepths[sortedDepths.length - 1]}`,
+          });
+        }
+        break;
+      }
+      const group = depthGroups.get(depth);
+      const shown = group.slice(0, MAX_PER_RING);
+      const hidden = group.length - shown.length;
+      for (const a of shown) {
+        visibleIds.add(a.id);
+        const nd = nodes.find(n => n.id === a.id);
+        visNodes.push({
+          ...(nd || {}), id: a.id, isSelected: false, isAffected: true,
+          isSummary: false, isDep: false, affectedDepth: a.depth,
+        });
+      }
+      if (hidden > 0) {
+        summaryNodes.push({
+          id: `__summary_d${depth}__`, isSummary: true, isSelected: false,
+          isAffected: true, isDep: false, affectedDepth: depth,
+          label: `+${hidden} more`, sublabel: `at depth ${depth}`,
+        });
+      }
+    }
+
+    // Dependencies of selected
+    const depNodes = [];
+    for (const l of links) {
+      if (l.source === selected && !visibleIds.has(l.target)) {
+        const nd = nodes.find(n => n.id === l.target);
+        if (nd) {
+          depNodes.push({
+            ...nd, id: l.target, isSelected: false, isAffected: false,
+            isSummary: false, isDep: true, affectedDepth: 0,
+          });
+          visibleIds.add(l.target);
+        }
+      }
+    }
+    const shownDeps = depNodes.slice(0, 8);
+    if (depNodes.length > 8) {
+      summaryNodes.push({
+        id: "__summary_deps__", isSummary: true, isSelected: false,
+        isAffected: false, isDep: true, affectedDepth: 0,
+        label: `+${depNodes.length - 8} deps`, sublabel: "dependencies",
+      });
+    }
+
+    const allNodes = [...visNodes, ...shownDeps, ...summaryNodes];
+    const visLinks = links.filter(l =>
+      visibleIds.has(l.source) && visibleIds.has(l.target)
+    ).map(l => ({ source: l.source, target: l.target }));
+
+    if (allNodes.length === 0) return;
+
+    // ── Deterministic radial positions ──
+    const activeDepths = [...new Set(
+      allNodes.filter(n => !n.isSelected && !n.isDep).map(n => n.affectedDepth)
+    )].sort((a, b) => a - b);
+    const numRings = Math.max(1, activeDepths.length);
+    const minRing = Math.min(width, height) * 0.15;
+    const maxRing = Math.min(width, height) * 0.43;
+    const ringGap = numRings > 1 ? (maxRing - minRing) / (numRings - 1) : 0;
+
+    const depthToRadius = (d) => {
+      const idx = activeDepths.indexOf(d);
+      return idx >= 0 ? minRing + idx * ringGap : minRing + numRings * ringGap;
+    };
+
+    // Bucket by depth
+    const ringBuckets = new Map();
+    for (const n of allNodes) {
+      if (n.isSelected || n.isDep) continue;
+      const d = n.affectedDepth;
+      if (!ringBuckets.has(d)) ringBuckets.set(d, []);
+      ringBuckets.get(d).push(n);
+    }
+
+    for (const n of allNodes) {
+      if (n.isSelected) { n.x = cx; n.y = cy; continue; }
+      if (n.isDep) {
+        const list = [...shownDeps, ...summaryNodes.filter(s => s.isDep)];
+        const idx = list.indexOf(n);
+        const count = list.length;
+        const r = minRing * 0.75;
+        const spread = Math.min(Math.PI * 0.7, count * 0.3);
+        const start = Math.PI / 2 - spread / 2;
+        const step = count > 1 ? spread / (count - 1) : 0;
+        n.x = cx + r * Math.cos(start + idx * step);
+        n.y = cy + r * Math.sin(start + idx * step);
+        continue;
+      }
+      const d = n.affectedDepth;
+      const bucket = ringBuckets.get(d) ?? [];
+      const idx = bucket.indexOf(n);
+      const count = bucket.length;
+      const r = depthToRadius(d);
+      const angleStep = (2 * Math.PI) / Math.max(1, count);
+      const offset = (d % 2) * (angleStep / 2);
+      const angle = offset + idx * angleStep - Math.PI / 2;
+      n.x = cx + r * Math.cos(angle);
+      n.y = cy + r * Math.sin(angle);
+    }
+
+    const nodeMap = new Map(allNodes.map(n => [n.id, n]));
+
+    // ── SVG Defs ──
+    const defs = svg.append("defs");
+    defs.append("marker").attr("id", "ar")
+      .attr("viewBox", "0 -5 10 10").attr("refX", 18).attr("refY", 0)
+      .attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
+      .append("path").attr("d", "M0,-4L8,0L0,4").attr("fill", "rgba(248,113,113,0.5)");
+    defs.append("marker").attr("id", "ad")
+      .attr("viewBox", "0 -5 10 10").attr("refX", 18).attr("refY", 0)
+      .attr("markerWidth", 5).attr("markerHeight", 5).attr("orient", "auto")
+      .append("path").attr("d", "M0,-4L8,0L0,4").attr("fill", "rgba(148,163,184,0.2)");
+    const glF = defs.append("filter").attr("id", "gl")
+      .attr("x", "-50%").attr("y", "-50%").attr("width", "200%").attr("height", "200%");
+    glF.append("feGaussianBlur").attr("stdDeviation", "4").attr("result", "b");
+    const gm = glF.append("feMerge");
+    gm.append("feMergeNode").attr("in", "b");
+    gm.append("feMergeNode").attr("in", "SourceGraphic");
+
+    // ── Root with zoom/pan ──
+    const rootG = svg.append("g");
+    svg.call(d3.zoom().scaleExtent([0.2, 4]).on("zoom", ev => rootG.attr("transform", ev.transform)));
+
+    // Ring guides
+    for (const depth of activeDepths) {
+      if (depth <= 0) continue;
+      const r = depthToRadius(depth);
+      rootG.append("circle").attr("cx", cx).attr("cy", cy).attr("r", r)
+        .attr("fill", "none")
+        .attr("stroke", depth === 1 ? "rgba(248,113,113,0.06)" : "rgba(148,163,184,0.03)")
+        .attr("stroke-dasharray", "3 5");
+    }
+
+    // ── Links ──
+    const curvePath = (l) => {
+      const s = nodeMap.get(l.source), t = nodeMap.get(l.target);
+      if (!s || !t) return "";
+      const dx = t.x - s.x, dy = t.y - s.y;
+      const dr = Math.sqrt(dx * dx + dy * dy) * 0.55;
+      return `M${s.x},${s.y}A${dr},${dr} 0 0,1 ${t.x},${t.y}`;
+    };
+    const isImpactLink = (l) => affectedSet.has(l.source) || l.target === selected || l.source === selected;
+
+    const linkG = rootG.append("g");
+    const linkSel = linkG.selectAll("path").data(visLinks).join("path")
+      .attr("d", curvePath).attr("fill", "none")
+      .attr("stroke", l => isImpactLink(l) ? "rgba(248,113,113,0.22)" : "rgba(148,163,184,0.05)")
+      .attr("stroke-width", l => isImpactLink(l) ? 1.2 : 0.4)
+      .attr("marker-end", l => isImpactLink(l) ? "url(#ar)" : "url(#ad)")
+      .attr("opacity", 0);
+    linkSel.transition().duration(500).delay((_, i) => 200 + i * 8).attr("opacity", 1);
+
+    // ── Nodes ──
+    const isLargeGraph = allNodes.length > 30;
+    const nR = (d) => {
+      if (d.isSelected) return 16;
+      if (d.isSummary) return 14;
+      if (isLargeGraph) return d.affectedDepth === 1 ? 8 : 6;
+      return d.isAffected ? 11 : 8;
+    };
+
+    const nodeG = rootG.append("g");
+    const nodeSel = nodeG.selectAll("g").data(allNodes, d => d.id).join("g")
+      .attr("transform", `translate(${cx},${cy})`)
+      .attr("cursor", "pointer")
+      .on("click", (_, d) => {
+        if (d.isSummary) {
+          if (d.id === "__summary_deep__") setMaxVisibleDepth(p => p + 2);
+          return;
+        }
+        if (d.id !== selected) setSelected(d.id);
+      });
+
+    nodeSel.transition().duration(550)
+      .delay(d => d.isSelected ? 0 : 60 + (d.affectedDepth || 0) * 70)
+      .ease(d3.easeCubicOut)
+      .attr("transform", d => `translate(${d.x},${d.y})`);
+
+    // Drag
+    nodeSel.call(d3.drag()
+      .on("start", function () { d3.select(this).raise(); })
+      .on("drag", function (ev, d) {
+        d.x = ev.x; d.y = ev.y;
+        d3.select(this).attr("transform", `translate(${d.x},${d.y})`);
+        linkSel.attr("d", curvePath);
+      })
+    );
+
+    // Pulse on selected
+    nodeSel.filter(d => d.isSelected).each(function () {
+      const g = d3.select(this);
+      const p = g.append("circle").attr("r", 18).attr("fill", "none")
+        .attr("stroke", "#f87171").attr("stroke-width", 2).attr("opacity", 0.5);
+      (function tick() {
+        p.attr("r", 18).attr("opacity", 0.5).attr("stroke-width", 2)
+          .transition().duration(1400).ease(d3.easeCubicOut)
+          .attr("r", 32).attr("opacity", 0).attr("stroke-width", 0.5)
+          .on("end", tick);
+      })();
+      g.append("circle").attr("r", 22).attr("fill", "none")
+        .attr("stroke", "#f87171").attr("stroke-width", 1)
+        .attr("stroke-dasharray", "3 3").attr("opacity", 0.2);
+    });
+
+    // Node circles
+    nodeSel.append("circle").attr("r", 0)
+      .attr("fill", d => {
+        if (d.isSelected) return "rgba(248,113,113,0.15)";
+        if (d.isSummary) return "rgba(148,163,184,0.08)";
+        if (d.isAffected) return `rgba(251,191,36,${Math.max(0.04, 0.15 - d.affectedDepth * 0.02)})`;
+        return "rgba(96,165,250,0.08)";
+      })
+      .attr("stroke", d => {
+        if (d.isSelected) return "#f87171";
+        if (d.isSummary) return "rgba(148,163,184,0.4)";
+        if (d.isAffected) return `rgba(251,191,36,${Math.max(0.3, 0.8 - d.affectedDepth * 0.08)})`;
+        return "rgba(96,165,250,0.3)";
+      })
+      .attr("stroke-width", d => d.isSelected ? 2.5 : d.isSummary ? 1.5 : 1.2)
+      .attr("stroke-dasharray", d => d.isSummary ? "3 2" : null)
+      .attr("filter", d => d.isSelected ? "url(#gl)" : null)
+      .transition().duration(400)
+      .delay(d => d.isSelected ? 0 : 80 + (d.affectedDepth || 0) * 50)
+      .ease(d3.easeBackOut.overshoot(1))
+      .attr("r", nR);
+
+    // Center icon
+    nodeSel.filter(d => d.isSelected).append("text")
+      .text("⊗").attr("text-anchor", "middle").attr("dy", 5)
+      .attr("font-size", 14).attr("fill", "#f87171");
+
+    // Inner dot on depth-1/2
+    nodeSel.filter(d => d.isAffected && !d.isSelected && !d.isSummary && d.affectedDepth <= 2)
+      .append("circle").attr("r", 2.5)
+      .attr("fill", d => d.affectedDepth === 1 ? "#f87171" : "#fbbf24");
+
+    // Summary labels (always visible)
+    nodeSel.filter(d => d.isSummary).each(function (d) {
+      const g = d3.select(this);
+      g.append("text").text(d.label)
+        .attr("text-anchor", "middle").attr("dy", 1)
+        .attr("font-size", 9).attr("font-weight", 700)
+        .attr("fill", "rgba(148,163,184,0.7)").attr("font-family", "var(--font-mono)");
+      g.append("text").text(d.sublabel)
+        .attr("text-anchor", "middle").attr("dy", 12)
+        .attr("font-size", 7).attr("fill", "rgba(148,163,184,0.4)")
+        .attr("font-family", "var(--font-mono)");
+    });
+
+    // Node labels (hidden in large graphs, shown on hover)
+    nodeSel.filter(d => !d.isSummary).append("text")
+      .text(d => d.id.length > 26 ? d.id.slice(0, 24) + "…" : d.id)
+      .attr("text-anchor", "middle")
+      .attr("dy", d => nR(d) + 11)
+      .attr("font-size", d => d.isSelected ? 10 : 8)
+      .attr("font-weight", d => d.isSelected ? 700 : 400)
+      .attr("fill", d => d.isSelected ? "#f87171" : d.isAffected ? "rgba(251,191,36,0.7)" : "rgba(96,165,250,0.6)")
+      .attr("font-family", "var(--font-mono)")
+      .attr("class", "node-label")
+      .attr("opacity", d => {
+        if (d.isSelected) return 1;
+        if (!isLargeGraph && d.affectedDepth === 1) return 1;
+        if (isLargeGraph) return 0;
+        return 0.8;
+      });
+
+    // Hover: enlarge + show label + highlight connected links
+    nodeSel.filter(d => !d.isSelected && !d.isSummary)
+      .on("mouseenter", function (_, d) {
+        const el = d3.select(this);
+        el.raise();
+        el.select("circle").transition().duration(120)
+          .attr("stroke-width", 2.5).attr("r", nR(d) + 4);
+        el.select(".node-label").transition().duration(120)
+          .attr("opacity", 1).attr("font-size", 10);
+        linkSel.transition().duration(120)
+          .attr("opacity", l => (l.source === d.id || l.target === d.id) ? 1 : 0.12)
+          .attr("stroke-width", l => (l.source === d.id || l.target === d.id) ? 2 : 0.3);
+      })
+      .on("mouseleave", function (_, d) {
+        const el = d3.select(this);
+        el.select("circle").transition().duration(150)
+          .attr("stroke-width", 1.2).attr("r", nR(d));
+        el.select(".node-label").transition().duration(150)
+          .attr("opacity", (!isLargeGraph && d.affectedDepth === 1) ? 1 : isLargeGraph ? 0 : 0.8)
+          .attr("font-size", 8);
+        linkSel.transition().duration(200)
+          .attr("opacity", 1)
+          .attr("stroke-width", l => isImpactLink(l) ? 1.2 : 0.4);
+      });
+
+  }, [selected, blastKey, activeTab, maxVisibleDepth]);
 
   return (
     <>
