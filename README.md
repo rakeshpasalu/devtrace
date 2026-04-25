@@ -12,8 +12,8 @@
 <h1 align="center">DevTrace Studio</h1>
 
 <p align="center">
-  <strong>Enterprise-grade observability workspace for Spring Boot applications</strong><br/>
-  Watch everything from JVM boot to live request handling — without modifying business code.
+  <strong>Enterprise-grade observability for Spring Boot applications and AI agents</strong><br/>
+  Trace everything from JVM boot to live requests to MCP agent decisions — without modifying business code.
 </p>
 
 <p align="center">
@@ -80,7 +80,7 @@ DevTrace Studio is a developer-focused observability platform that provides deep
 
 ## Dashboard Views
 
-DevTrace ships with **26 purpose-built views** organized into logical groups:
+DevTrace ships with **31 purpose-built views** organized into logical groups:
 
 ### Observe
 
@@ -90,9 +90,10 @@ DevTrace ships with **26 purpose-built views** organized into logical groups:
 | **Execution Timeline** | Gantt-style span timing visualization for the selected trace. |
 | **Request Flow** | Nested call tree showing controller → service → repository → SQL execution. |
 | **Flame Graph** | Interactive flame chart with zoom, click-to-inspect, component color coding, and SQL highlighting. |
-| **Live Tail** | Real-time event stream with type/component/service filters, severity toggles, pause/resume, auto-scroll, expandable detail, JSON copy. |
+| **Live Tail** | Real-time event stream with type/component/service filters, severity toggles, pause/resume, auto-scroll. |
+| **Log Explorer** | Structured log search with level, logger, trace-ID, and full-text filters. |
+| **Ask DevTrace** | Natural language query — ask questions in English, get traces, logs, and metrics. |
 | **Service Topology** | D3 force-directed graph showing inter-service communication patterns. |
-| **Nerd Console** | Terminal-style event feed with category filters, search, stats strip, expandable rows. |
 
 ### Analyze
 
@@ -100,9 +101,19 @@ DevTrace ships with **26 purpose-built views** organized into logical groups:
 |------|-------------|
 | **Endpoint Analytics** | Per-endpoint p50/p95/p99 latency, error rates, component breakdown, trace drill-down, anomaly detection. |
 | **Trace Diff** | Side-by-side comparison of two traces — span timing diffs, added/removed spans, component breakdown delta. |
+| **Test Generator** | Select any trace → generate a runnable JUnit 5 + Spring Boot Test with mocked outbound calls. |
 | **Blast Radius** | Select any bean → see transitive dependency impact with D3 graph, affected list, severity rating. |
 | **Architecture Score** | 5-dimension scoring (complexity, performance, reliability, maintainability, scalability) with radar chart. |
 | **Service Autopsy** | Full health report — grade, bottlenecks, recommendations, bean inventory, error summary. |
+| **AI Copilot** | Pattern detection (N+1 queries, slow chains, error propagation) with LLM prompt generation. |
+
+### Agent Traces
+
+| View | Description |
+|------|-------------|
+| **Agent Execution Tree** | Full MCP agent session visualization — decisions, tool calls, sub-agent spawns, retries, cost & token tracking. |
+| **Anomaly Detection** | Real-time alerts for infinite loops, runaway costs, excessive retries, token budget blowout. |
+| **Shareable Links** | One-click share — generate a time-limited URL for any trace or agent session. |
 
 ### Operate
 
@@ -285,7 +296,19 @@ All endpoints are available under `/api/v1/` with backward-compatible `/api/` al
 | `GET` | `/api/v1/diff?a=&b=` | Comparative trace diff |
 | `GET` | `/api/v1/report` | Full service autopsy report |
 | `GET` | `/api/v1/architecture-score` | Architecture Intelligence Score dimensions |
+| `GET` | `/api/v1/logs` | Query logs — `?level=`, `?q=`, `?traceId=`, `?limit=` |
+| `GET` | `/api/v1/query?q=` | Natural language query — ask in English, get structured results |
+| `GET` | `/api/v1/requests/:traceId/generate-test` | Generate JUnit test code from a captured trace |
 | `POST` | `/ingest` | Ingest events from agents/starters |
+
+### Agent & MCP APIs
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/agent-sessions` | List agent sessions — `?agentId=`, `?status=`, `?limit=` |
+| `GET` | `/api/v1/agent-sessions/:sessionId` | Full agent session with execution tree events |
+| `POST` | `/api/v1/share` | Create a shareable link — `{ traceId?, sessionId?, expiresIn? }` |
+| `GET` | `/api/v1/share/:token` | Resolve a share link to its trace/session data |
 
 ### Saved Views APIs
 
@@ -504,13 +527,31 @@ cd frontend && npm audit
 
 ## Roadmap
 
+### ✅ Recently Shipped
+
+- [x] **Agent Execution Tree** — 16 MCP/agent event types, full execution tree with tool calls, sub-agent spawns, cost & token tracking
+- [x] **Agent Anomaly Detection** — real-time detection: infinite loops, runaway costs, excessive retries, token budget blowout
+- [x] **Shareable Trace Links** — time-limited URLs anyone can view without login
+- [x] **Natural Language Query** — ask questions in English ("show me errors in the last 5 minutes", "most expensive agent sessions")
+- [x] **Trace → Test Generator** — generate JUnit 5 + Spring Boot tests from captured production traces
+- [x] **Log Forwarding** — Logback appender captures all application logs in real-time
+
+### 🔜 Up Next
+
+- [ ] Python + TypeScript auto-instrumentation SDKs (`pip install devtrace`)
+- [ ] Automatic Root Cause Analysis — multi-signal correlation engine
+- [ ] Runtime Architecture Guardian — define rules as YAML, validate against live call patterns
+- [ ] Agent-to-Microservice Trace Stitching — from agent prompt to database row in one trace
+- [ ] Agent Replay & Diff — A/B test prompt changes against historical traces
+- [ ] IntelliJ Plugin — runtime metrics as inline gutter annotations
+
+### Infrastructure
+
 - [ ] OpenTelemetry Collector sidecar for OTLP export
 - [ ] Elasticsearch / OpenSearch persistence for long-term storage
 - [ ] Grafana / Tempo integration
 - [ ] Multi-user role-based access control
-- [ ] TLS termination via reverse proxy
 - [ ] Kubernetes Helm chart
-- [ ] Span-level alerting with webhook notifications
 
 ---
 

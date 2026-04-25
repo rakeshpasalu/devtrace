@@ -2,6 +2,8 @@ const DEFAULT_MAX_EVENTS = 50_000;
 const DEFAULT_MAX_TRACE_EVENTS = 4_000;
 const DEFAULT_MAX_REQUESTS = 1_500;
 const SLOW_METHOD_THRESHOLD_MS = Number(process.env.DEVTRACE_SLOW_THRESHOLD_MS ?? 150);
+const crypto = await import("node:crypto");
+const capitalize = (s) => s ? s.charAt(0).toUpperCase() + s.slice(1) : "";
 
 const STARTUP_EVENT_TYPES = new Set([
   "JVM_STARTED",
@@ -14,6 +16,14 @@ const STARTUP_EVENT_TYPES = new Set([
   "BEAN_NODE",
   "BEAN_EDGE",
   "AUTO_CONFIGURATION"
+]);
+
+const AGENT_EVENT_TYPES = new Set([
+  "AGENT_SESSION_START", "AGENT_DECISION", "AGENT_TOOL_CALL", "AGENT_TOOL_ERROR",
+  "AGENT_TOOL_RESULT", "AGENT_SPAWN", "AGENT_CONTEXT_HANDOFF", "AGENT_RETRY",
+  "AGENT_FALLBACK", "AGENT_GUARDRAIL_HIT", "AGENT_SESSION_END",
+  "LLM_COMPLETION", "LLM_STREAMING_CHUNK",
+  "MCP_SERVER_CONNECT", "MCP_SERVER_DISCONNECT", "MCP_TOOL_DISCOVERY",
 ]);
 
 export class EventStore {
@@ -38,6 +48,9 @@ export class EventStore {
     this.bookmarks = new Map();       // traceId → bookmark object (server-synced saved views)
     this.logs = [];                   // ring buffer for LOG events
     this.maxLogs = 5_000;
+    this.agentSessions = new Map();   // sessionId → agent session object
+    this.maxAgentSessions = 500;
+    this.shareLinks = new Map();      // token → { traceId?, sessionId?, expiresAt, createdAt }
   }
 
   ingest(input) {
@@ -72,6 +85,7 @@ export class EventStore {
         beanEdges: this.beanEdges.size,
         services: diagnostics.services.length,
         logCount: this.logs.length,
+        agentSessions: this.agentSessions.size,
       },
       recentEvents: this.events.slice(-750),
       requests,
@@ -80,6 +94,7 @@ export class EventStore {
       diagnostics,
       endpointAnalytics: this.analytics(),
       logs: this.logs.slice(-200),
+      agentSessions: this.queryAgentSessions({ limit: 50 }),
     };
   }
 
@@ -299,6 +314,245 @@ export class EventStore {
       });
       this.trim(this.logs, this.maxLogs);
     }
+
+    // ─── Agent / MCP event processing ───
+    if (AGENT_EVENT_TYPES.has(event.type)) {
+      this.processAgentEvent(event);
+    }
+  }
+
+  processAgentEvent(event) {
+    const sessionId = event.attributes?.sessionId ?? event.attributes?.agent?.sessionId ?? event.spanId ?? "unknown";
+    let session = this.agentSessions.get(sessionId);
+
+    if (!session) {
+      session = {
+        sessionId,
+        agentId: event.attributes?.agent?.agentId ?? event.attributes?.agentId ?? event.service ?? "unknown",
+        agentName: event.attributes?.agent?.agentName ?? event.attributes?.agentName ?? event.name ?? "Agent",
+        model: event.attributes?.agent?.model ?? event.attributes?.model ?? null,
+        goal: event.attributes?.agent?.goal ?? event.attributes?.goal ?? null,
+        parentSessionId: event.attributes?.agent?.parentAgentId ?? event.attributes?.parentSessionId ?? null,
+        status: "running",
+        startTime: event.timestamp,
+        endTime: null,
+        events: [],
+        toolCalls: 0,
+        totalTokens: 0,
+        totalCostUsd: 0,
+        errors: 0,
+        retries: 0,
+        subAgents: [],
+        service: event.service ?? null,
+        traceId: event.traceId ?? null,
+      };
+      this.agentSessions.set(sessionId, session);
+      // Trim old sessions
+      if (this.agentSessions.size > this.maxAgentSessions) {
+        const oldest = [...this.agentSessions.entries()].sort((a, b) => a[1].startTime - b[1].startTime)[0];
+        if (oldest) this.agentSessions.delete(oldest[0]);
+      }
+    }
+
+    // Append the event
+    session.events.push(event);
+    if (session.events.length > 2000) session.events.splice(0, session.events.length - 2000);
+
+    // Update session metrics based on event type
+    switch (event.type) {
+      case "AGENT_SESSION_START":
+        session.goal = event.attributes?.goal ?? session.goal;
+        session.model = event.attributes?.model ?? session.model;
+        break;
+
+      case "AGENT_TOOL_CALL":
+        session.toolCalls += 1;
+        session.totalTokens += Number(event.attributes?.tool?.inputTokens ?? event.attributes?.inputTokens ?? 0);
+        session.totalTokens += Number(event.attributes?.tool?.outputTokens ?? event.attributes?.outputTokens ?? 0);
+        session.totalCostUsd += Number(event.attributes?.tool?.costUsd ?? event.attributes?.costUsd ?? 0);
+        break;
+
+      case "AGENT_TOOL_ERROR":
+        session.errors += 1;
+        break;
+
+      case "AGENT_RETRY":
+        session.retries += 1;
+        break;
+
+      case "AGENT_SPAWN": {
+        const childSessionId = event.attributes?.childSessionId ?? event.attributes?.sessionId;
+        if (childSessionId && !session.subAgents.includes(childSessionId)) {
+          session.subAgents.push(childSessionId);
+        }
+        break;
+      }
+
+      case "LLM_COMPLETION": {
+        const promptTokens = Number(event.attributes?.promptTokens ?? event.attributes?.inputTokens ?? 0);
+        const completionTokens = Number(event.attributes?.completionTokens ?? event.attributes?.outputTokens ?? 0);
+        const cost = Number(event.attributes?.costUsd ?? 0);
+        session.totalTokens += promptTokens + completionTokens;
+        session.totalCostUsd += cost;
+        break;
+      }
+
+      case "AGENT_SESSION_END":
+        session.status = event.attributes?.outcome ?? event.status ?? "completed";
+        session.endTime = event.timestamp;
+        break;
+
+      case "AGENT_GUARDRAIL_HIT":
+        session.errors += 1;
+        break;
+    }
+
+    // ─── Real-time anomaly detection ───
+    this.detectAgentAnomalies(session, event);
+  }
+
+  detectAgentAnomalies(session, event) {
+    if (!session._anomalies) session._anomalies = [];
+
+    // 1. Infinite loop detection: same tool called >5 times with similar inputs
+    if (event.type === "AGENT_TOOL_CALL") {
+      const toolName = event.attributes?.tool?.name ?? event.name;
+      const sameToolCalls = session.events.filter(e =>
+        e.type === "AGENT_TOOL_CALL" && (e.attributes?.tool?.name ?? e.name) === toolName
+      );
+      if (sameToolCalls.length >= 5) {
+        const existing = session._anomalies.find(a => a.type === "infinite_loop" && a.tool === toolName);
+        if (!existing) {
+          session._anomalies.push({
+            type: "infinite_loop",
+            severity: "critical",
+            tool: toolName,
+            count: sameToolCalls.length,
+            message: `Tool "${toolName}" called ${sameToolCalls.length} times — possible infinite loop`,
+            timestamp: event.timestamp,
+          });
+        }
+      }
+    }
+
+    // 2. Runaway cost detection
+    if (session.totalCostUsd > 1.0) {
+      const existing = session._anomalies.find(a => a.type === "runaway_cost");
+      if (!existing) {
+        session._anomalies.push({
+          type: "runaway_cost",
+          severity: "critical",
+          message: `Session cost exceeded $1.00 (current: $${session.totalCostUsd.toFixed(4)})`,
+          timestamp: event.timestamp,
+        });
+      }
+    }
+
+    // 3. Excessive retries
+    if (session.retries >= 3) {
+      const existing = session._anomalies.find(a => a.type === "excessive_retries");
+      if (!existing) {
+        session._anomalies.push({
+          type: "excessive_retries",
+          severity: "warning",
+          message: `${session.retries} retries in this session — check tool reliability`,
+          timestamp: event.timestamp,
+        });
+      }
+    }
+
+    // 4. Context budget blowout (>80% of token budget)
+    if (event.type === "AGENT_TOOL_CALL" || event.type === "LLM_COMPLETION") {
+      const budget = event.attributes?.budget;
+      if (budget && budget.tokenBudget > 0) {
+        const utilization = (budget.tokensUsed ?? session.totalTokens) / budget.tokenBudget;
+        if (utilization > 0.8) {
+          const existing = session._anomalies.find(a => a.type === "token_budget_warning");
+          if (!existing) {
+            session._anomalies.push({
+              type: "token_budget_warning",
+              severity: utilization > 0.95 ? "critical" : "warning",
+              message: `Token budget ${(utilization * 100).toFixed(0)}% consumed (${budget.tokensUsed ?? session.totalTokens}/${budget.tokenBudget})`,
+              timestamp: event.timestamp,
+            });
+          }
+        }
+      }
+    }
+
+    // 5. Long-running session (>60s)
+    const elapsed = event.timestamp - session.startTime;
+    if (elapsed > 60000 && session.status === "running") {
+      const existing = session._anomalies.find(a => a.type === "long_running");
+      if (!existing) {
+        session._anomalies.push({
+          type: "long_running",
+          severity: "warning",
+          message: `Session running for ${Math.round(elapsed / 1000)}s — consider adding a timeout`,
+          timestamp: event.timestamp,
+        });
+      }
+    }
+
+    // 6. Deep sub-agent nesting
+    if (event.type === "AGENT_SPAWN" && session.subAgents.length >= 3) {
+      const existing = session._anomalies.find(a => a.type === "deep_nesting");
+      if (!existing) {
+        session._anomalies.push({
+          type: "deep_nesting",
+          severity: "warning",
+          message: `${session.subAgents.length} sub-agents spawned — review delegation strategy`,
+          timestamp: event.timestamp,
+        });
+      }
+    }
+  }
+
+  queryAgentSessions(filters = {}) {
+    let sessions = [...this.agentSessions.values()];
+    if (filters.agentId) {
+      sessions = sessions.filter(s => s.agentId === filters.agentId);
+    }
+    if (filters.status) {
+      sessions = sessions.filter(s => s.status === filters.status);
+    }
+    const limit = Math.min(Number(filters.limit ?? 100), 500);
+    return sessions
+      .sort((a, b) => b.startTime - a.startTime)
+      .slice(0, limit)
+      .map(s => ({
+        sessionId: s.sessionId,
+        agentId: s.agentId,
+        agentName: s.agentName,
+        model: s.model,
+        goal: s.goal,
+        parentSessionId: s.parentSessionId,
+        status: s.status,
+        startTime: s.startTime,
+        endTime: s.endTime,
+        durationMs: s.endTime ? s.endTime - s.startTime : Date.now() - s.startTime,
+        toolCalls: s.toolCalls,
+        totalTokens: s.totalTokens,
+        totalCostUsd: Math.round(s.totalCostUsd * 10000) / 10000,
+        errors: s.errors,
+        retries: s.retries,
+        subAgentCount: s.subAgents.length,
+        eventCount: s.events.length,
+        anomalies: s._anomalies ?? [],
+        service: s.service,
+        traceId: s.traceId,
+      }));
+  }
+
+  agentSession(sessionId) {
+    const session = this.agentSessions.get(sessionId);
+    if (!session) return null;
+    return {
+      ...session,
+      anomalies: session._anomalies ?? [],
+      durationMs: session.endTime ? session.endTime - session.startTime : Date.now() - session.startTime,
+      totalCostUsd: Math.round(session.totalCostUsd * 10000) / 10000,
+    };
   }
 
   processTraceEvent(event) {
@@ -614,6 +868,355 @@ export class EventStore {
       }
     }
     return count;
+  }
+
+  /* ─── Shareable Trace Links ─── */
+
+  createShareLink({ traceId, sessionId, expiresIn = 86400000 } = {}) {
+    if (!traceId && !sessionId) return null;
+    const token = crypto.randomBytes(16).toString("hex");
+    const link = {
+      token,
+      traceId: traceId ?? null,
+      sessionId: sessionId ?? null,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + expiresIn,
+    };
+    this.shareLinks.set(token, link);
+    // Trim old links
+    if (this.shareLinks.size > 1000) {
+      const now = Date.now();
+      for (const [k, v] of this.shareLinks) {
+        if (v.expiresAt < now) this.shareLinks.delete(k);
+      }
+    }
+    return link;
+  }
+
+  resolveShareLink(token) {
+    const link = this.shareLinks.get(token);
+    if (!link) return null;
+    if (Date.now() > link.expiresAt) {
+      this.shareLinks.delete(token);
+      return null;
+    }
+    // Resolve the data
+    const result = { ...link };
+    if (link.traceId) {
+      result.trace = this.request(link.traceId);
+    }
+    if (link.sessionId) {
+      result.agentSession = this.agentSession(link.sessionId);
+    }
+    return result;
+  }
+
+  /* ─── Natural Language Query Engine ─── */
+
+  naturalLanguageQuery(question) {
+    const q = question.toLowerCase().trim();
+    const now = Date.now();
+    const results = { question, interpretedAs: null, results: [], stats: {} };
+
+    // Parse time references
+    let timeWindow = 0;
+    if (/last\s*(1|one)\s*min/i.test(q)) timeWindow = 60_000;
+    else if (/last\s*(5|five)\s*min/i.test(q)) timeWindow = 300_000;
+    else if (/last\s*(15|fifteen)\s*min/i.test(q)) timeWindow = 900_000;
+    else if (/last\s*(1|one)\s*h/i.test(q)) timeWindow = 3_600_000;
+    else if (/last\s*(24|twenty)/i.test(q)) timeWindow = 86_400_000;
+    else if (/today/i.test(q)) timeWindow = 86_400_000;
+
+    const inTime = (ts) => timeWindow === 0 || (now - ts) <= timeWindow;
+
+    // ─── Error / failure queries ───
+    if (/error|fail|exception|5\d\d|crash|broke/i.test(q)) {
+      results.interpretedAs = "Find errors and failures" + (timeWindow ? ` in the last ${timeWindow / 60000}m` : "");
+      const requests = [...this.requests.values()]
+        .filter(r => (r.status === "ERROR" || String(r.status).startsWith("5")) && inTime(r.lastSeen))
+        .map(r => this.summarizeRequest(r))
+        .sort((a, b) => b.lastSeen - a.lastSeen)
+        .slice(0, 20);
+      const errorLogs = this.logs.filter(l => l.level === "ERROR" && inTime(l.timestamp)).slice(-20);
+      const agentErrors = [...this.agentSessions.values()]
+        .filter(s => s.errors > 0 && inTime(s.startTime))
+        .map(s => ({ sessionId: s.sessionId, agentName: s.agentName, errors: s.errors, goal: s.goal }));
+      results.results = requests;
+      results.stats = { errorRequests: requests.length, errorLogs: errorLogs.length, agentErrors: agentErrors.length };
+      results.errorLogs = errorLogs;
+      results.agentErrors = agentErrors;
+      return results;
+    }
+
+    // ─── Slow / latency queries ───
+    if (/slow|latency|p95|p99|timeout|delay|took long|performance/i.test(q)) {
+      results.interpretedAs = "Find slow requests and endpoints";
+      const thresholdMatch = q.match(/(\d+)\s*ms/);
+      const threshold = thresholdMatch ? Number(thresholdMatch[1]) : 500;
+
+      const slowRequests = [...this.requests.values()]
+        .filter(r => inTime(r.lastSeen))
+        .map(r => this.summarizeRequest(r))
+        .filter(r => r.durationMs > threshold)
+        .sort((a, b) => b.durationMs - a.durationMs)
+        .slice(0, 20);
+
+      const slowEndpoints = this.analytics()
+        .filter(e => e.p95 > threshold)
+        .sort((a, b) => b.p95 - a.p95)
+        .slice(0, 10);
+
+      results.results = slowRequests;
+      results.stats = { slowRequests: slowRequests.length, slowEndpoints: slowEndpoints.length, threshold };
+      results.slowEndpoints = slowEndpoints;
+      return results;
+    }
+
+    // ─── Database / SQL queries ───
+    if (/database|sql|query|db|n\+1|jdbc|hikari|connection/i.test(q)) {
+      results.interpretedAs = "Find database-related activity";
+      const dbEvents = this.events
+        .filter(e => (e.type === "DATABASE_QUERY" || e.type === "SQL_STATEMENT") && inTime(e.timestamp))
+        .slice(-50);
+      const slowDb = dbEvents.filter(e => Number(e.durationMs ?? 0) > 100);
+      results.results = dbEvents.map(e => ({
+        type: e.type, name: e.name, durationMs: e.durationMs, traceId: e.traceId,
+        sql: e.attributes?.sql?.slice(0, 200), component: e.component, timestamp: e.timestamp,
+      }));
+      results.stats = { totalQueries: dbEvents.length, slowQueries: slowDb.length };
+      return results;
+    }
+
+    // ─── Agent queries ───
+    if (/agent|mcp|tool call|llm|token|cost|session|ai|bot/i.test(q)) {
+      results.interpretedAs = "Find agent sessions and AI activity";
+      let sessions = this.queryAgentSessions({ limit: 50 });
+
+      if (/expensive|cost|spend|money|budget|\$/i.test(q)) {
+        sessions = sessions.sort((a, b) => b.totalCostUsd - a.totalCostUsd);
+        results.interpretedAs = "Find most expensive agent sessions";
+      }
+      if (/fail|error/i.test(q)) {
+        sessions = sessions.filter(s => s.errors > 0);
+        results.interpretedAs = "Find failed agent sessions";
+      }
+      if (/anomal|loop|runaway/i.test(q)) {
+        sessions = sessions.filter(s => (s.anomalies?.length ?? 0) > 0);
+        results.interpretedAs = "Find agent sessions with anomalies";
+      }
+
+      const totalCost = sessions.reduce((s, sess) => s + (sess.totalCostUsd ?? 0), 0);
+      const totalTokens = sessions.reduce((s, sess) => s + (sess.totalTokens ?? 0), 0);
+      results.results = sessions;
+      results.stats = { sessions: sessions.length, totalCost, totalTokens };
+      return results;
+    }
+
+    // ─── Service-specific queries ───
+    const serviceMatch = q.match(/(?:from|in|for|service)\s+["\']?([a-z0-9_-]+)/i);
+    if (serviceMatch) {
+      const svc = serviceMatch[1];
+      results.interpretedAs = `Find traces from service "${svc}"`;
+      const requests = [...this.requests.values()]
+        .filter(r => r.service?.toLowerCase().includes(svc) && inTime(r.lastSeen))
+        .map(r => this.summarizeRequest(r))
+        .sort((a, b) => b.lastSeen - a.lastSeen)
+        .slice(0, 30);
+      results.results = requests;
+      results.stats = { matchingTraces: requests.length };
+      return results;
+    }
+
+    // ─── Endpoint-specific queries ───
+    const pathMatch = q.match(/(?:get|post|put|delete|patch)\s+([/][a-z0-9/_{}*-]+)/i);
+    if (pathMatch) {
+      const path = pathMatch[1];
+      const method = q.match(/(get|post|put|delete|patch)/i)?.[1]?.toUpperCase();
+      results.interpretedAs = `Find ${method ?? ""} ${path} requests`;
+      const requests = [...this.requests.values()]
+        .filter(r => r.path?.includes(path) && (!method || r.method === method) && inTime(r.lastSeen))
+        .map(r => this.summarizeRequest(r))
+        .sort((a, b) => b.lastSeen - a.lastSeen)
+        .slice(0, 30);
+      results.results = requests;
+      results.stats = { matchingTraces: requests.length };
+      return results;
+    }
+
+    // ─── Throughput / count queries ───
+    if (/how many|count|throughput|volume|traffic/i.test(q)) {
+      results.interpretedAs = "Show throughput statistics";
+      const allReqs = [...this.requests.values()].filter(r => inTime(r.lastSeen));
+      const errors = allReqs.filter(r => r.status === "ERROR" || String(r.status).startsWith("5"));
+      results.stats = {
+        totalRequests: allReqs.length,
+        errors: errors.length,
+        errorRate: allReqs.length > 0 ? ((errors.length / allReqs.length) * 100).toFixed(1) + "%" : "0%",
+        totalEvents: this.events.filter(e => inTime(e.timestamp)).length,
+        totalLogs: this.logs.filter(l => inTime(l.timestamp)).length,
+        agentSessions: [...this.agentSessions.values()].filter(s => inTime(s.startTime)).length,
+      };
+      results.results = this.analytics().slice(0, 10);
+      return results;
+    }
+
+    // ─── Fallback: full-text search across traces ───
+    results.interpretedAs = `Search for "${question}" across traces, logs, and events`;
+    const matchingRequests = [...this.requests.values()]
+      .filter(r => {
+        const haystack = [r.traceId, r.requestId, r.method, r.path, r.service, ...(r.events ?? []).map(e => e.name)].join(" ").toLowerCase();
+        return haystack.includes(q) && inTime(r.lastSeen);
+      })
+      .map(r => this.summarizeRequest(r))
+      .slice(0, 20);
+    const matchingLogs = this.logs
+      .filter(l => (l.message?.toLowerCase().includes(q) || l.logger?.toLowerCase().includes(q)) && inTime(l.timestamp))
+      .slice(-20);
+    results.results = matchingRequests;
+    results.matchingLogs = matchingLogs;
+    results.stats = { matchingTraces: matchingRequests.length, matchingLogs: matchingLogs.length };
+    return results;
+  }
+
+  /* ─── Trace → Test Generator ─── */
+
+  generateTest(traceId) {
+    const rq = this.requests.get(traceId);
+    if (!rq) return null;
+    const events = rq.events ?? [];
+    const summary = this.summarizeRequest(rq);
+
+    const method = summary.method ?? "GET";
+    const path = summary.path ?? "/";
+    const service = summary.service ?? "MyService";
+    const status = summary.status ?? "200";
+
+    // Extract key spans
+    const controllerSpans = events.filter(e => e.type === "SPAN_FINISHED" && e.component === "controller");
+    const serviceSpans = events.filter(e => e.type === "SPAN_FINISHED" && e.component === "service");
+    const repoSpans = events.filter(e => e.type === "SPAN_FINISHED" && e.component === "repository");
+    const sqlEvents = events.filter(e => e.type === "SQL_STATEMENT" || e.type === "DATABASE_QUERY");
+    const httpOutbound = events.filter(e => e.type === "SPAN_FINISHED" && (e.component === "RestTemplate" || e.component === "WebClient" || e.component === "http-client"));
+    const errors = events.filter(e => e.type === "ERROR" || e.status === "ERROR");
+
+    // Build class name from path
+    const pathParts = path.split("/").filter(Boolean);
+    const entityName = pathParts[pathParts.length - 1]?.replace(/[^a-zA-Z]/g, "") ?? "Resource";
+    const testClassName = `${capitalize(entityName)}_${method.charAt(0) + method.slice(1).toLowerCase()}_RegressionTest`;
+    const controllerName = controllerSpans[0]?.className?.split(".")?.pop() ?? `${capitalize(entityName)}Controller`;
+
+    // Build mock beans
+    const mockBeans = new Set();
+    httpOutbound.forEach(e => {
+      const cls = e.className?.split(".")?.pop();
+      if (cls) mockBeans.add(cls);
+    });
+
+    // Build SQL assertions
+    const sqlSummary = sqlEvents.map(e => {
+      const sql = e.attributes?.sql ?? e.name ?? "";
+      const type = sql.trim().split(/\s+/)[0]?.toUpperCase() ?? "QUERY";
+      return { type, sql: sql.slice(0, 120), durationMs: e.durationMs };
+    });
+
+    // Generate the test code
+    let code = `package ${service.replace(/[^a-zA-Z.]/g, "").toLowerCase()};
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.boot.test.context.SpringBootTest;
+${mockBeans.size > 0 ? "import org.springframework.boot.test.mock.bean.MockBean;" : ""}
+import org.springframework.test.web.servlet.MockMvc;
+${errors.length > 0 ? "" : "import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;"}
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.${method.toLowerCase()};
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+
+/**
+ * Regression test generated from DevTrace trace: ${traceId}
+ * Captured: ${new Date(summary.firstSeen).toISOString()}
+ * Endpoint: ${method} ${path}
+ * Duration: ${summary.durationMs}ms | Events: ${events.length}
+ */
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@AutoConfigureMockMvc
+class ${testClassName} {
+
+    @Autowired
+    private MockMvc mockMvc;
+`;
+
+    for (const bean of mockBeans) {
+      code += `\n    @MockBean\n    private ${bean} ${bean.charAt(0).toLowerCase() + bean.slice(1)};\n`;
+    }
+
+    code += `
+    @Test
+    void should_handle_${method.toLowerCase()}_${path.replace(/[^a-zA-Z0-9]/g, "_").replace(/_+/g, "_")}() throws Exception {
+        // This test was auto-generated from a captured production trace.
+        // Trace ID: ${traceId}
+        // Original status: ${status} | Duration: ${summary.durationMs}ms
+`;
+
+    if (mockBeans.size > 0) {
+      code += `\n        // ─── Stub outbound calls (captured from trace) ───\n`;
+      httpOutbound.forEach(e => {
+        const cls = e.className?.split(".")?.pop();
+        const meth = e.methodName ?? "call";
+        code += `        // ${cls}.${meth}() — ${e.durationMs ?? "?"}ms in production\n`;
+        code += `        // when(${cls ? cls.charAt(0).toLowerCase() + cls.slice(1) : "client"}.${meth}(any())).thenReturn(/* stub from captured response */);\n\n`;
+      });
+    }
+
+    code += `\n        // ─── Execute request ───\n`;
+    code += `        mockMvc.perform(${method.toLowerCase()}("${path}")`;
+    code += `)\n`;
+
+    if (status === "ERROR" || String(status).startsWith("5")) {
+      code += `                .andExpect(status().is5xxServerError());\n`;
+    } else if (String(status).startsWith("4")) {
+      code += `                .andExpect(status().is4xxClientError());\n`;
+    } else if (status === "IN_PROGRESS") {
+      code += `                .andExpect(status().isOk()); // was still in progress when captured\n`;
+    } else {
+      code += `                .andExpect(status().is(${status === "OK" ? 200 : status}));\n`;
+    }
+
+    if (sqlSummary.length > 0) {
+      code += `\n        // ─── Database assertions (${sqlSummary.length} SQL statements captured) ───\n`;
+      const grouped = {};
+      sqlSummary.forEach(s => { grouped[s.type] = (grouped[s.type] ?? 0) + 1; });
+      for (const [type, count] of Object.entries(grouped)) {
+        code += `        // ${count}x ${type} statements observed\n`;
+      }
+    }
+
+    if (serviceSpans.length > 0) {
+      code += `\n        // ─── Service layer calls (${serviceSpans.length} captured) ───\n`;
+      serviceSpans.forEach(s => {
+        const cls = s.className?.split(".")?.pop() ?? "Service";
+        code += `        // ${cls}.${s.methodName ?? "method"}() — ${s.durationMs ?? "?"}ms\n`;
+      });
+    }
+
+    code += `    }\n}\n`;
+
+    return {
+      traceId,
+      testClassName,
+      language: "java",
+      framework: "spring-boot-test",
+      code,
+      summary: {
+        method, path, status, durationMs: summary.durationMs,
+        controllerSpans: controllerSpans.length,
+        serviceSpans: serviceSpans.length,
+        repoSpans: repoSpans.length,
+        sqlStatements: sqlEvents.length,
+        outboundCalls: httpOutbound.length,
+        errors: errors.length,
+      },
+    };
   }
 
   /**

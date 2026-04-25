@@ -109,6 +109,21 @@ v1.get("/requests/:traceId/replay", (req, res) => {
 
 v1.get("/analytics", (_req, res) => res.json(store.analytics()));
 
+// ─── Natural Language Query ──────────────────────────────────────────
+v1.get("/query", (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: "Provide ?q=your question" });
+  const result = store.naturalLanguageQuery(q);
+  res.json(result);
+});
+
+// ─── Trace → Test Generator ─────────────────────────────────────────
+v1.get("/requests/:traceId/generate-test", (req, res) => {
+  const test = store.generateTest(req.params.traceId);
+  if (!test) return res.status(404).json({ error: "Trace not found." });
+  res.json(test);
+});
+
 v1.get("/logs", (req, res) => {
   res.json(store.queryLogs({
     level: req.query.level,
@@ -120,6 +135,34 @@ v1.get("/logs", (req, res) => {
 
 v1.get("/report", (_req, res) => res.json(store.report()));
 v1.get("/architecture-score", (_req, res) => res.json(store.architectureScore()));
+
+// ─── Agent Sessions ──────────────────────────────────────────────────
+v1.get("/agent-sessions", (req, res) => {
+  res.json(store.queryAgentSessions({
+    agentId: req.query.agentId,
+    status: req.query.status,
+    limit: req.query.limit,
+  }));
+});
+
+v1.get("/agent-sessions/:sessionId", (req, res) => {
+  const session = store.agentSession(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Agent session not found." });
+  res.json(session);
+});
+
+// ─── Shareable Trace Links ───────────────────────────────────────────
+v1.post("/share", (req, res) => {
+  const result = store.createShareLink(req.body);
+  if (!result) return res.status(400).json({ error: "Provide traceId or sessionId." });
+  res.json(result);
+});
+
+v1.get("/share/:token", (req, res) => {
+  const data = store.resolveShareLink(req.params.token);
+  if (!data) return res.status(404).json({ error: "Share link expired or not found." });
+  res.json(data);
+});
 
 // ─── Bookmarks (server-synced saved views) ──────────────────────────────
 v1.get("/bookmarks", (_req, res) => res.json(store.listBookmarks()));

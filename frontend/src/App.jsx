@@ -1,8 +1,8 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
-  Activity, BarChart3, Bell, Bookmark, Box, Brain, Clock, Crosshair, FileText, Flame, GitBranch, GitCompare, HelpCircle, LayoutDashboard,
+  Activity, BarChart3, Bell, Bookmark, Bot, Box, Brain, Clock, Crosshair, FileText, Flame, GitBranch, GitCompare, HelpCircle, LayoutDashboard,
   List, Network, Play, Pause, Radio, Search, Server, Settings, Stethoscope, Target, Terminal, TrendingUp, Zap, Rocket,
-  Skull, Award
+  Skull, Award, Code
 } from "lucide-react";
 import AICopilotPage from "./components/AICopilotPage.jsx";
 import LiveTailPage from "./components/LiveTailPage.jsx";
@@ -20,6 +20,9 @@ import SLOTrackerPage from "./components/SLOTrackerPage.jsx";
 import AlertRulesPage from "./components/AlertRulesPage.jsx";
 import DependencyImpactPage from "./components/DependencyImpactPage.jsx";
 import SavedViewsPage from "./components/SavedViewsPage.jsx";
+import AgentTracePage from "./components/AgentTracePage.jsx";
+import NLQueryPage from "./components/NLQueryPage.jsx";
+import TestGeneratorPage from "./components/TestGeneratorPage.jsx";
 import { ToastProvider, useToast } from "./components/ToastProvider.jsx";
 import BeanGraph from "./components/BeanGraph.jsx";
 import CommandPalette from "./components/CommandPalette.jsx";
@@ -46,10 +49,13 @@ const PAGES = [
   { id: "topology",    label: "Service Topology",   icon: Network,         group: "observe" },
   { id: "livetail",    label: "Live Tail",          icon: Radio,           group: "observe" },
   { id: "logs",        label: "Log Explorer",       icon: FileText,        group: "observe" },
+  { id: "nlquery",     label: "Ask DevTrace",       icon: Brain,           group: "observe" },
   { id: "beans",       label: "Bean Graph",         icon: GitBranch,       group: "inspect" },
   { id: "impact",      label: "Blast Radius",       icon: Crosshair,       group: "inspect" },
   { id: "diff",        label: "Trace Diff",         icon: GitCompare,      group: "inspect" },
+  { id: "testgen",     label: "Test Generator",     icon: Code,            group: "inspect" },
   { id: "aicopilot",   label: "AI Copilot",         icon: Brain,           group: "inspect" },
+  { id: "agents",      label: "Agent Traces",       icon: Bot,             group: "inspect" },
   { id: "diagnostics", label: "Diagnostics",        icon: Stethoscope,     group: "inspect" },
   { id: "replay",      label: "Request Replay",     icon: Play,            group: "inspect" },
   { id: "nerd",        label: "Nerd Console",       icon: Terminal,        group: "inspect" },
@@ -69,6 +75,7 @@ const EMPTY_SNAPSHOT = {
   diagnostics: { errors: [], slowSpans: [], hottestComponents: [], services: [] },
   endpointAnalytics: [],
   logs: [],
+  agentSessions: [],
 };
 
 /* Time range options */
@@ -184,6 +191,11 @@ function AppShell() {
             }));
           if (newLogs.length > 0) {
             updated.logs = [...(c.logs ?? []), ...newLogs].slice(-5000);
+          }
+          // Extract agent events and update agentSessions count
+          const agentEvents = d.payload.filter(e => e.type?.startsWith("AGENT_") || e.type?.startsWith("LLM_") || e.type?.startsWith("MCP_"));
+          if (agentEvents.length > 0 && updated.stats) {
+            updated.stats = { ...updated.stats, agentSessions: (updated.stats.agentSessions ?? 0) };
           }
           return updated;
         });
@@ -341,6 +353,9 @@ function AppShell() {
           )}
           <div className="header-stat"><Activity size={14}/> <strong>{snapshot.stats?.retainedEvents ?? 0}</strong> events</div>
           <div className="header-stat"><Server size={14}/> <strong>{snapshot.stats?.services ?? 0}</strong> services</div>
+          {(snapshot.stats?.agentSessions ?? 0) > 0 && (
+            <div className="header-stat"><Bot size={14}/> <strong>{snapshot.stats.agentSessions}</strong> agents</div>
+          )}
           <div className="header-stat"><Clock size={14}/> {formatTimestamp(lastUpdated)}</div>
         </div>
       </header>
@@ -446,6 +461,17 @@ function AppShell() {
             selectedTraceId={selectedTraceId}
             onSelectTrace={(id) => { setSelectedTraceId(id); }}
             onNavigate={setActivePage} />
+        )}
+        {activePage === "agents" && (
+          <AgentTracePage snapshot={filteredSnapshot} />
+        )}
+        {activePage === "nlquery" && (
+          <NLQueryPage snapshot={filteredSnapshot}
+            onNavigateToTrace={(id) => { setSelectedTraceId(id); setActivePage("traces"); }}
+            onNavigate={setActivePage} />
+        )}
+        {activePage === "testgen" && (
+          <TestGeneratorPage requests={filteredRequests} />
         )}
       </main>
     </div>
@@ -626,6 +652,9 @@ function DashboardPage({ snapshot }) {
         <MetricCard icon={<Box size={16}/>} label="Beans Mapped" value={stats.beanNodes ?? 0} />
         <MetricCard icon={<Server size={16}/>} label="Services" value={stats.services ?? 0} />
         <MetricCard icon={<FileText size={16}/>} label="Logs" value={stats.logCount ?? 0} />
+        {(stats.agentSessions ?? 0) > 0 && (
+          <MetricCard icon={<Bot size={16}/>} label="Agent Sessions" value={stats.agentSessions} />
+        )}
       </div>
 
       <div className="dashboard-grid">
