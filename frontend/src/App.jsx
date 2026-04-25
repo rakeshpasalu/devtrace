@@ -1,9 +1,10 @@
 import { startTransition, useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
 import {
-  Activity, BarChart3, Bell, Bookmark, Box, Clock, Crosshair, Flame, GitBranch, GitCompare, HelpCircle, LayoutDashboard,
+  Activity, BarChart3, Bell, Bookmark, Box, Brain, Clock, Crosshair, Flame, GitBranch, GitCompare, HelpCircle, LayoutDashboard,
   List, Network, Play, Pause, Radio, Search, Server, Settings, Stethoscope, Target, Terminal, TrendingUp, Zap, Rocket,
   Skull, Award
 } from "lucide-react";
+import AICopilotPage from "./components/AICopilotPage.jsx";
 import LiveTailPage from "./components/LiveTailPage.jsx";
 import EndpointAnalyticsPage from "./components/EndpointAnalyticsPage.jsx";
 import FaqPage from "./components/FaqPage.jsx";
@@ -46,6 +47,7 @@ const PAGES = [
   { id: "beans",       label: "Bean Graph",         icon: GitBranch,       group: "inspect" },
   { id: "impact",      label: "Blast Radius",       icon: Crosshair,       group: "inspect" },
   { id: "diff",        label: "Trace Diff",         icon: GitCompare,      group: "inspect" },
+  { id: "aicopilot",   label: "AI Copilot",         icon: Brain,           group: "inspect" },
   { id: "diagnostics", label: "Diagnostics",        icon: Stethoscope,     group: "inspect" },
   { id: "replay",      label: "Request Replay",     icon: Play,            group: "inspect" },
   { id: "nerd",        label: "Nerd Console",       icon: Terminal,        group: "inspect" },
@@ -410,6 +412,12 @@ function AppShell() {
         )}
         {activePage === "livetail" && (
           <LiveTailPage recentEvents={filteredEvents} snapshot={filteredSnapshot} />
+        )}
+        {activePage === "aicopilot" && (
+          <AICopilotPage requests={filteredRequests} snapshot={filteredSnapshot}
+            selectedTraceId={selectedTraceId}
+            onSelectTrace={(id) => { setSelectedTraceId(id); }}
+            onNavigate={setActivePage} />
         )}
       </main>
     </div>
